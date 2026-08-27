@@ -452,13 +452,45 @@ function apiLabel(n){
   if(!p)return `<span class="muted">Aguardando API</span>`;
   return `<span class="apiPrice">${money(p.last||p.min||p.max||0)}</span><div class="apiStock">${p.stockKnown===true?num(p.currentStock??p.stock??0)+" em estoque":"preço salvo • estoque não confirmado"}</div>`;
 }
+let staticMarketCache=null;
+async function loadStaticMarket(){
+  if(staticMarketCache)return staticMarketCache;
+  const r=await fetch("market.json?ts="+Date.now(),{cache:"no-store"});
+  if(!r.ok)throw Error("market.json HTTP "+r.status);
+  staticMarketCache=await r.json();
+  return staticMarketCache;
+}
 async function marketFetch(path, timeoutMs=90000){
   const controller=new AbortController();
   const timer=setTimeout(()=>controller.abort(),timeoutMs);
   try{
-    const r=await fetch("/api"+path,{cache:"no-store",signal:controller.signal});
-    if(!r.ok)throw Error("HTTP "+r.status);
-    return await r.json();
+    // Local mode keeps using server.py. GitHub Pages is static, so it falls
+    // back automatically to the scheduled market.json snapshot.
+    try{
+      const r=await fetch("/api"+path,{cache:"no-store",signal:controller.signal});
+      if(r.ok)return await r.json();
+      if(location.protocol!=="file:")throw Error("API HTTP "+r.status);
+    }catch(apiErr){
+      // Continue to the static snapshot below.
+    }
+    const u=new URL(path,"https://static.invalid");
+    const q=u.searchParams;
+    const snap=await loadStaticMarket();
+    const items=Array.isArray(snap.items)?snap.items:Object.values(snap.items||{});
+    if(u.pathname==="/prices"||u.pathname==="/items"||u.pathname==="/item"){
+      const wanted=(q.get("ids")||q.get("id")||"").split(",").map(Number).filter(Boolean);
+      return items.filter(x=>wanted.includes(Number(x.id)));
+    }
+    if(u.pathname==="/dashboard"){
+      const wanted=(q.get("ids")||"").split(",").map(Number).filter(Boolean);
+      return {items:items.filter(x=>wanted.includes(Number(x.id))),liveStock:true,staticSnapshot:true,updatedAt:snap.updatedAt};
+    }
+    if(u.pathname==="/history"){
+      const id=Number(q.get("id")||0);
+      const name=snap.names?.[String(id)];
+      return name&&snap.history?.[name]?snap.history[name]:[];
+    }
+    throw Error("Endpoint não suportado no modo estático");
   }finally{clearTimeout(timer);}
 }
 function normalizeV2(arr){
