@@ -1,0 +1,12 @@
+CORREÇÃO — MERCADO SA BDO-Lifeskill
+
+Arquivos corrigidos:
+- update_market.py — corrige a leitura da resposta em lote da API Arsha V1 e aceita a linha base dos itens quando minEnhance=0.
+- servidor.py — aplica a mesma correção para o modo local.
+
+No GitHub:
+1. Substitua update_market.py pelo arquivo desta pasta.
+2. Substitua servidor.py pelo arquivo desta pasta, mantendo o nome do seu repositório como servidor.py.
+3. Faça o commit diretamente na branch principal/principal.
+4. O workflow "Atualizar mercado BDO" deve executar automaticamente.
+5. Não altere index.html, script1.js ou mercado.json.

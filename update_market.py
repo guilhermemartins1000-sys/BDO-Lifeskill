@@ -75,22 +75,44 @@ def extract_data():
 
 
 def parse_v1(data,wanted):
+    """Parse Arsha V1 /item responses robustly.
+
+    POST /v1/:region/item returns an ARRAY of result objects when multiple
+    IDs are supplied. Older code only accepted a dict, which silently turned
+    a valid response into zero market rows. Also, the base row for many items
+    is minEnhance=0 with maxEnhance=7 (not 0/0), so accepting only 0/0
+    incorrectly discarded valid base-market data.
+    """
     out={}
-    msg=str(data.get('resultMsg','')) if isinstance(data,dict) else ''
-    for row in msg.split('|'):
-        a=row.split('-')
-        if len(a)<10: continue
-        try:
-            iid=int(a[0]); mn=int(a[1]); mx=int(a[2])
-            if iid not in wanted or mn!=0 or mx!=0: continue
-            out[iid]={
-                'id':iid,'sid':0,'basePrice':int(a[3]),
-                'currentStock':int(a[4]),'stockKnown':True,
-                'totalTrades':int(a[5]),'priceMin':int(a[6]),
-                'priceMax':int(a[7]),'lastSoldPrice':int(a[8]),
-                'lastSoldTime':int(a[9]),'source':'Arsha SA v1'
-            }
-        except Exception: pass
+    if isinstance(data,dict):
+        rows=[data]
+    elif isinstance(data,list):
+        rows=[]
+        for x in data:
+            if isinstance(x,dict):
+                rows.append(x)
+            elif isinstance(x,list):
+                rows.extend(y for y in x if isinstance(y,dict))
+    else:
+        rows=[]
+    for obj in rows:
+        msg=str(obj.get('resultMsg',''))
+        for row in msg.split('|'):
+            a=row.split('-')
+            if len(a)<10: continue
+            try:
+                iid=int(a[0]); mn=int(a[1]); mx=int(a[2])
+                # V1 represents the base item as minEnhance=0. maxEnhance
+                # may be 0, 7, or another base-range value depending on item.
+                if iid not in wanted or mn!=0 or iid in out: continue
+                out[iid]={
+                    'id':iid,'sid':0,'basePrice':int(a[3]),
+                    'currentStock':int(a[4]),'stockKnown':True,
+                    'totalTrades':int(a[5]),'priceMin':int(a[6]),
+                    'priceMax':int(a[7]),'lastSoldPrice':int(a[8]),
+                    'lastSoldTime':int(a[9]),'source':'Arsha SA v1'
+                }
+            except Exception: pass
     return out
 
 
