@@ -382,7 +382,7 @@ function priceBadge(name){
   return `<span class="muted">Sem preço</span>`;
 }
 
-const S={harmoniaQty:1,edaniaQty:1,elixirQty:1,prices:{},dashboardPrices:{},drug:{},history:{},salesDaily:{},salesSnapshot:{},swaps:{},warehouse:{},perfumeMarketLoaded:{},perfumeMarketLoading:{},last:null};try{Object.assign(S,JSON.parse(localStorage.getItem("bdo_complete_v2")||"{}"))}catch(e){}
+const S={harmoniaQty:1,edaniaQty:1,elixirQty:1,prices:{},dashboardPrices:{},drug:{},history:{},salesDaily:{},salesSnapshot:{},salesHistory:{},swaps:{},warehouse:{},perfumeMarketLoaded:{},perfumeMarketLoading:{},marketSnapshot:null,last:null};try{Object.assign(S,JSON.parse(localStorage.getItem("bdo_complete_v2")||"{}"))}catch(e){}
 if(!S.swaps||typeof S.swaps!=="object")S.swaps={};
 if(!S.recipeSwaps||typeof S.recipeSwaps!=="object")S.recipeSwaps={};
 if(!S.recipeAcq||typeof S.recipeAcq!=="object")S.recipeAcq={};
@@ -452,45 +452,13 @@ function apiLabel(n){
   if(!p)return `<span class="muted">Aguardando API</span>`;
   return `<span class="apiPrice">${money(p.last||p.min||p.max||0)}</span><div class="apiStock">${p.stockKnown===true?num(p.currentStock??p.stock??0)+" em estoque":"preço salvo • estoque não confirmado"}</div>`;
 }
-let staticMarketCache=null;
-async function loadStaticMarket(){
-  if(staticMarketCache)return staticMarketCache;
-  const r=await fetch("market.json?ts="+Date.now(),{cache:"no-store"});
-  if(!r.ok)throw Error("market.json HTTP "+r.status);
-  staticMarketCache=await r.json();
-  return staticMarketCache;
-}
 async function marketFetch(path, timeoutMs=90000){
   const controller=new AbortController();
   const timer=setTimeout(()=>controller.abort(),timeoutMs);
   try{
-    // Local mode keeps using server.py. GitHub Pages is static, so it falls
-    // back automatically to the scheduled market.json snapshot.
-    try{
-      const r=await fetch("/api"+path,{cache:"no-store",signal:controller.signal});
-      if(r.ok)return await r.json();
-      if(location.protocol!=="file:")throw Error("API HTTP "+r.status);
-    }catch(apiErr){
-      // Continue to the static snapshot below.
-    }
-    const u=new URL(path,"https://static.invalid");
-    const q=u.searchParams;
-    const snap=await loadStaticMarket();
-    const items=Array.isArray(snap.items)?snap.items:Object.values(snap.items||{});
-    if(u.pathname==="/prices"||u.pathname==="/items"||u.pathname==="/item"){
-      const wanted=(q.get("ids")||q.get("id")||"").split(",").map(Number).filter(Boolean);
-      return items.filter(x=>wanted.includes(Number(x.id)));
-    }
-    if(u.pathname==="/dashboard"){
-      const wanted=(q.get("ids")||"").split(",").map(Number).filter(Boolean);
-      return {items:items.filter(x=>wanted.includes(Number(x.id))),liveStock:true,staticSnapshot:true,updatedAt:snap.updatedAt};
-    }
-    if(u.pathname==="/history"){
-      const id=Number(q.get("id")||0);
-      const name=snap.names?.[String(id)];
-      return name&&snap.history?.[name]?snap.history[name]:[];
-    }
-    throw Error("Endpoint não suportado no modo estático");
+    const r=await fetch("/api"+path,{cache:"no-store",signal:controller.signal});
+    if(!r.ok)throw Error("HTTP "+r.status);
+    return await r.json();
   }finally{clearTimeout(timer);}
 }
 function normalizeV2(arr){
@@ -512,12 +480,57 @@ function normalizeV2(arr){
   return out;
 }
 let marketRefreshRunning=false;
+const isGitHubPagesHost=()=>/\.github\.io$/i.test(location.hostname);
+async function loadStaticMarketSnapshot(){
+  const r=await fetch(`./market.json?ts=${Date.now()}`,{cache:'no-store'});
+  if(!r.ok)throw Error('market.json HTTP '+r.status);
+  const data=await r.json();
+  if(!data||!Array.isArray(data.items))throw Error('market.json inválido');
+  S.marketSnapshot=data;
+  const idToName={};
+  for(const [name,id] of Object.entries(DATA.priceIds||{}))idToName[String(id)]=name;
+  S.dashboardPrices=S.dashboardPrices||{};
+  for(const p of data.items){
+    const name=p.name||idToName[String(p.id)];
+    if(!name)continue;
+    const normalized={...p,name,id:Number(p.id)};
+    S.prices[name]=normalized;
+    S.dashboardPrices[name]=normalized;
+    if(name.startsWith('Fármaco')||name.startsWith('Elixir'))S.drug[name]=normalized;
+  }
+  for(const [id,vals] of Object.entries(data.history||{})){
+    const name=idToName[String(id)];
+    if(name&&Array.isArray(vals)&&vals.length)S.history[name]=vals.map(Number).filter(v=>v>0).slice(-7);
+  }
+  if(data.salesHistory)S.salesHistory=data.salesHistory;
+  if(data.salesSnapshot)S.salesSnapshot=data.salesSnapshot;
+  if(data.generatedAt)S.dashboardAt=data.generatedAt;
+  S.last=data.generatedAt||new Date().toLocaleString('pt-BR');
+  save();
+  return data;
+}
 async function updateAllMarketPrices(auto=false){
   if(marketRefreshRunning)return false;
   marketRefreshRunning=true;
   status(auto?"⟳ Atualização automática do Mercado SA...":"Atualizando Mercado SA em lote...","wait");
   $("refresh").disabled=true;
   $("content").classList.add("loading");
+  // GitHub Pages é estático: no site online, o snapshot gerado pelo GitHub
+  // Actions é a fonte oficial. Assim não dependemos de /api ou de CORS.
+  if(isGitHubPagesHost()){
+    try{
+      const snap=await loadStaticMarketSnapshot();
+      const count=snap.items.length;
+      status(`✓ Mercado SA atualizado: ${count} itens • ${snap.generatedAt||"agora"}`,"ok");
+      render();
+      $("content").classList.remove("loading");
+      $("refresh").disabled=false;
+      marketRefreshRunning=false;
+      return count>0;
+    }catch(e){
+      status("⚠ Snapshot online indisponível; tentando a API local...","wait");
+    }
+  }
   const entries=Object.entries(DATA.priceIds||{});
   const marketEntries=entries.filter(([name])=>{
     const m=PRICE_META[name];
@@ -668,6 +681,11 @@ function dashboardPrice(name){
   return S.dashboardPrices[name]||S.prices[name]||{};
 }
 async function loadDashboardHistories(names){
+  if(isGitHubPagesHost()){
+    // O snapshot já contém os históricos disponíveis; SV permanece quando
+    // não houve observação nos últimos 7 dias.
+    return;
+  }
   const list=[...new Set(names.filter(n=>DATA.priceIds?.[n] && !PRICE_META[n]))];
   const now=Date.now(); S.historyAt=S.historyAt||{};
   const pending=list.filter(n=>!Array.isArray(S.history?.[n]) || !S.history[n].length || now-Number(S.historyAt[n]||0)>3600000);
@@ -678,6 +696,11 @@ async function loadDashboardHistories(names){
 }
 async function loadDashboardMarket(){
   try{
+    if(isGitHubPagesHost()){
+      await loadStaticMarketSnapshot();
+      if(page==='home')home(false);
+      return;
+    }
     // O Dashboard usa os mesmos preços já carregados pelo lote principal como
     // base imediata. Assim ele nunca fica 0/x enquanto a consulta exclusiva
     // do Dashboard ainda está respondendo ou quando o servidor retorna uma
