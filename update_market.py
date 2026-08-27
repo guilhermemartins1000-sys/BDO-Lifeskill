@@ -1,257 +1,393 @@
 #!/usr/bin/env python3
-"""Build a static SA market snapshot for BDO Lifeskill.
+# -*- coding: utf-8 -*-
 
-Runs in GitHub Actions. The browser only reads market.json, so GitHub Pages
-never needs a Python server or a CORS proxy.
 """
+Atualizador do mercado BDO SA para GitHub Actions.
+
+Objetivo:
+- Consultar a API comunitária Arsha.io na região SA.
+- Gravar um mercado.json estático para o GitHub Pages.
+- Manter histórico local de snapshots.
+- NUNCA substituir um mercado válido por um arquivo vazio se a API falhar.
+- Não depende de servidor Python, proxy CORS ou bibliotecas externas.
+
+Endpoint principal documentado:
+https://api.arsha.io/v2/sa/market
+
+O GitHub Actions deve executar este arquivo e depois fazer commit/push
+do mercado.json.
+"""
+
 from __future__ import annotations
-import json, os, re, time, urllib.request, urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import json
+import os
+import sys
+import time
 from datetime import datetime, timezone
-
-ROOT=os.path.dirname(os.path.abspath(__file__))
-INDEX=os.path.join(ROOT,'index.html')
-SNAP=os.path.join(ROOT,'market.json')
-HIST=os.path.join(ROOT,'market_history.json')
-V1='https://api.arsha.io/v1/sa'
-V2='https://api.arsha.io/v2/sa'
-UA='Mozilla/5.0 BDO-Lifeskill-Market/1.0'
-
-NPC_OR_DERIVED={'Catalisador Mágico','Água Purificada','Garrafa Vazia','Sal','Açúcar'}
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
-def http_json(url, method='GET', payload=None, timeout=30):
-    data=None
-    headers={'User-Agent':UA,'Accept':'application/json'}
-    if payload is not None:
-        data=json.dumps(payload).encode('utf-8')
-        headers['Content-Type']='application/json'
-    req=urllib.request.Request(url,data=data,method=method,headers=headers)
-    with urllib.request.urlopen(req,timeout=timeout) as r:
-        raw=r.read()
-        return json.loads(raw.decode('utf-8'))
+ROOT = Path(__file__).resolve().parent
+MARKET_FILE = ROOT / "mercado.json"
+
+API_URL = "https://api.arsha.io/v2/sa/market"
+HOT_URL = "https://api.arsha.io/v2/sa/hot?lang=en"
+
+USER_AGENT = "BDO-Lifeskill-Market/2.0"
+TIMEOUT = 45
+MAX_RETRIES = 4
+
+# O site atual usa estas chaves. Elas são preservadas para compatibilidade.
+SCHEMA_VERSION = 2
 
 
-def _balanced_object(text,start):
-    depth=0; in_str=False; esc=False; quote=''
-    for i in range(start,len(text)):
-        c=text[i]
-        if in_str:
-            if esc: esc=False
-            elif c=='\\': esc=True
-            elif c==quote: in_str=False
-        else:
-            if c in ('"',"'"): in_str=True; quote=c
-            elif c=='{': depth+=1
-            elif c=='}':
-                depth-=1
-                if depth==0:return text[start:i+1],i+1
-    raise ValueError('objeto JS não fechado')
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def extract_data():
-    text=open(INDEX,encoding='utf-8').read()
-    start=text.index('const DATA=')+len('const DATA=')
-    obj,end=_balanced_object(text,start)
-    data=json.loads(obj)
-    # The current site extends DATA.priceIds after the main DATA object.
-    # Merge every explicit priceIds assignment so the online counter matches
-    # the full dashboard catalog (not just the original 117 IDs).
-    for m in re.finditer(r'Object\.assign\(DATA\.priceIds\|\|\{\},\s*\{',text):
-        brace=text.find('{',m.start())
+def request_json(url: str) -> Any:
+    last_error: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            block,_=_balanced_object(text,brace)
-            data.setdefault('priceIds',{}).update(json.loads(block))
-        except Exception:
-            pass
-    m=re.search(r'const STRATEGIC_IDS=\{',text)
-    if m:
-        try:
-            block,_=_balanced_object(text,text.find('{',m.start()))
-            data.setdefault('priceIds',{}).update(json.loads(block))
-        except Exception:
-            pass
-    return data
+            request = Request(
+                url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/json",
+                    "Cache-Control": "no-cache",
+                },
+                method="GET",
+            )
+
+            with urlopen(request, timeout=TIMEOUT) as response:
+                raw = response.read()
+                if not raw:
+                    raise RuntimeError("A API respondeu sem conteúdo.")
+
+                return json.loads(raw.decode("utf-8"))
+
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = exc
+            print(
+                f"[AVISO] tentativa {attempt}/{MAX_RETRIES} falhou: {exc}",
+                flush=True,
+            )
+
+            if attempt < MAX_RETRIES:
+                time.sleep(2 * attempt)
+
+    raise RuntimeError(f"Não foi possível consultar {url}: {last_error}")
 
 
-def parse_v1(data,wanted):
-    """Parse Arsha V1 /item responses robustly.
+def load_existing() -> dict[str, Any]:
+    if not MARKET_FILE.exists():
+        return {
+            "versão": SCHEMA_VERSION,
+            "Fonte": "Arsha.io BDO Market SA",
+            "geradoEm": None,
+            "Unid": [],
+            "história": {},
+            "histórico de vendas": {},
+            "Instantâneo de vendas": {},
+        }
 
-    POST /v1/:region/item returns an ARRAY of result objects when multiple
-    IDs are supplied. Older code only accepted a dict, which silently turned
-    a valid response into zero market rows. Also, the base row for many items
-    is minEnhance=0 with maxEnhance=7 (not 0/0), so accepting only 0/0
-    incorrectly discarded valid base-market data.
+    try:
+        data = json.loads(MARKET_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception as exc:
+        print(f"[AVISO] não foi possível ler mercado.json: {exc}", flush=True)
+
+    return {
+        "versão": SCHEMA_VERSION,
+        "Fonte": "Arsha.io BDO Market SA",
+        "geradoEm": None,
+        "Unid": [],
+        "história": {},
+        "histórico de vendas": {},
+        "Instantâneo de vendas": {},
+    }
+
+
+def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
     """
-    out={}
-    if isinstance(data,dict):
-        rows=[data]
-    elif isinstance(data,list):
-        rows=[]
-        for x in data:
-            if isinstance(x,dict):
-                rows.append(x)
-            elif isinstance(x,list):
-                rows.extend(y for y in x if isinstance(y,dict))
-    else:
-        rows=[]
-    for obj in rows:
-        msg=str(obj.get('resultMsg',''))
-        for row in msg.split('|'):
-            a=row.split('-')
-            if len(a)<10: continue
+    Normaliza a resposta V2 sem destruir campos que possam ser úteis
+    para o site futuramente.
+    """
+    result = dict(item)
+
+    # IDs e valores numéricos ficam consistentes.
+    for key in (
+        "id",
+        "sid",
+        "minEnhance",
+        "maxEnhance",
+        "currentStock",
+        "totalTrades",
+        "basePrice",
+        "priceMin",
+        "priceMax",
+        "lastSoldPrice",
+        "lastSoldTime",
+        "mainCategory",
+        "subCategory",
+    ):
+        if key in result:
             try:
-                iid=int(a[0]); mn=int(a[1]); mx=int(a[2])
-                # V1 represents the base item as minEnhance=0. maxEnhance
-                # may be 0, 7, or another base-range value depending on item.
-                if iid not in wanted or mn!=0 or iid in out: continue
-                out[iid]={
-                    'id':iid,'sid':0,'basePrice':int(a[3]),
-                    'currentStock':int(a[4]),'stockKnown':True,
-                    'totalTrades':int(a[5]),'priceMin':int(a[6]),
-                    'priceMax':int(a[7]),'lastSoldPrice':int(a[8]),
-                    'lastSoldTime':int(a[9]),'source':'Arsha SA v1'
-                }
-            except Exception: pass
-    return out
+                result[key] = int(result[key])
+            except (TypeError, ValueError):
+                pass
 
+    # Aliases úteis para versões do site que usam nomes em português.
+    if "currentStock" in result:
+        result["estoque"] = result["currentStock"]
 
-def parse_v2(data,wanted):
-    out={}
-    stack=[]
-    if isinstance(data,list):
-        for x in data:
-            stack.extend(x if isinstance(x,list) else [x])
-    elif isinstance(data,dict): stack=[data]
-    for x in stack:
-        if not isinstance(x,dict): continue
-        try:
-            iid=int(x.get('id') or 0); sid=int(x.get('sid') or 0)
-            if iid not in wanted or sid!=0: continue
-            stock=x.get('currentStock')
-            out[iid]={
-                'id':iid,'sid':0,'basePrice':int(x.get('basePrice') or 0),
-                'currentStock':int(stock) if stock is not None else None,
-                'stockKnown':stock is not None,
-                'totalTrades':int(x.get('totalTrades') or 0),
-                'priceMin':int(x.get('priceMin') or 0),
-                'priceMax':int(x.get('priceMax') or 0),
-                'lastSoldPrice':int(x.get('lastSoldPrice') or 0),
-                'lastSoldTime':int(x.get('lastSoldTime') or 0),
-                'source':'Arsha SA v2'
-            }
-        except Exception: pass
-    return out
+    if "basePrice" in result:
+        result["preçoBase"] = result["basePrice"]
 
+    if "priceMin" in result:
+        result["preçoMin"] = result["priceMin"]
 
-def fetch_items(ids):
-    wanted=set(ids); result={}
-    # Keep requests well below the size that caused partial responses before.
-    chunks=[ids[i:i+50] for i in range(0,len(ids),50)]
-    for chunk in chunks:
-        try: result.update(parse_v1(http_json(f'{V1}/item','POST',chunk,35),set(chunk)))
-        except Exception: pass
-        missing=[x for x in chunk if x not in result]
-        if missing:
-            try: result.update(parse_v2(http_json(f'{V2}/item?lang=en','POST',missing,35),set(missing)))
-            except Exception:
-                try: result.update(parse_v2(http_json(f'{V2}/item?id={urllib.parse.quote(",".join(map(str,missing)))}&lang=en',timeout=35),set(missing)))
-                except Exception: pass
+    if "priceMax" in result:
+        result["preçoMax"] = result["priceMax"]
+
+    if "lastSoldPrice" in result:
+        result["últimoPreço"] = result["lastSoldPrice"]
+
+    if "lastSoldTime" in result:
+        result["últimaVenda"] = result["lastSoldTime"]
+
     return result
 
 
-def fetch_history(iid):
-    try:
-        d=http_json(f'{V2}/history?id={iid}&sid=0&lang=pt',timeout=15)
-        if isinstance(d,dict) and isinstance(d.get('history'),dict):
-            vals=[int(v) for _,v in sorted(d['history'].items()) if int(v)>0]
-            return vals[-7:]
-    except Exception: pass
-    try:
-        d=http_json(f'{V1}/history?id={iid}&sid=0',timeout=12)
-        vals=[]
-        for v in str(d.get('resultMsg','')).split('-'):
-            try:
-                n=int(v)
-                if n>0: vals.append(n)
-            except Exception: pass
-        return vals[-7:]
-    except Exception: return []
+def valid_market(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+
+        if item.get("id") is None:
+            continue
+
+        items.append(normalize_item(item))
+
+    return items
 
 
-def main():
-    data=extract_data(); price_ids=data.get('priceIds',{})
-    market_names=[n for n in price_ids if n not in NPC_OR_DERIVED]
-    ids=[int(price_ids[n]) for n in market_names if str(price_ids[n]).isdigit()]
-    by_id=fetch_items(ids)
+def update_history(
+    previous: dict[str, Any],
+    items: list[dict[str, Any]],
+    generated_at: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    old_history = previous.get("história", {})
+    if not isinstance(old_history, dict):
+        old_history = {}
 
-    # History is intentionally focused on the items the Dashboard analyzes:
-    # all fármacos, their required elixirs, perfumes and strategic market IDs.
-    important=set()
-    important.update(data.get('drugs',{}).keys())
-    important.update(data.get('perfumes',{}).keys())
-    for _,definition in data.get('drugs',{}).items():
-        for item,_qty in definition[1]: important.add(item)
-    for item in ['Fármaco da Harmonia','Fármaco da Harmonia - Edania','Perfume da Perseverança','Perfume do Desejo']:
-        important.add(item)
-    important={n for n in important if n in price_ids and n not in NPC_OR_DERIVED}
-    # Include strategic IDs when their names are explicitly represented by the
-    # STRATEGIC_IDS block in the HTML.
-    text=open(INDEX,encoding='utf-8').read()
-    m=re.search(r'const STRATEGIC_IDS=\{(.*?)\};',text,re.S)
-    if m:
-        for n in re.findall(r'"([^"]+)"\s*:\s*(\d+)',m.group(1)):
-            if n[0] in price_ids: important.add(n[0])
-    history={}
-    important_ids=[int(price_ids[n]) for n in important if str(price_ids[n]).isdigit()]
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futures={ex.submit(fetch_history,i):i for i in important_ids}
-        for f in as_completed(futures):
-            iid=futures[f]
-            try:
-                vals=f.result()
-                if vals: history[str(iid)]=vals
-            except Exception: pass
+    old_sales = previous.get("histórico de vendas", {})
+    if not isinstance(old_sales, dict):
+        old_sales = {}
 
-    # Persistent demand history survives each scheduled workflow run.
-    try:
-        old=json.load(open(HIST,encoding='utf-8'))
-    except Exception:
-        old={}
-    snapshots=old.get('snapshots',{})
-    sales=old.get('salesHistory',{})
-    today=datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    now_ms=int(time.time()*1000)
-    for name in market_names:
-        iid=int(price_ids[name]); p=by_id.get(iid)
-        if not p: continue
-        trades=int(p.get('totalTrades') or 0)
-        prev=snapshots.get(name,{})
-        prev_trades=int(prev.get('trades') or 0)
-        if trades>0 and prev_trades>0 and trades>=prev_trades:
-            delta=trades-prev_trades
-            if delta>0:
-                arr=sales.setdefault(name,[])
-                row=next((x for x in arr if x.get('date')==today),None)
-                if row: row['delta']=int(row.get('delta') or 0)+delta
-                else: arr.append({'date':today,'delta':delta})
-                sales[name]=[x for x in arr if x.get('date','') >= datetime.fromtimestamp(time.time()-45*86400,timezone.utc).strftime('%Y-%m-%d')]
-        snapshots[name]={'trades':trades,'timestamp':now_ms}
+    old_snapshots = previous.get("Instantâneo de vendas", {})
+    if not isinstance(old_snapshots, dict):
+        old_snapshots = {}
 
-    # Do not carry bogus zeros into the online UI. Keep only real API rows.
-    items=list(by_id.values())
-    generated=datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')
-    payload={
-        'version':1,
-        'source':'GitHub Actions • Arsha SA',
-        'generatedAt':generated,
-        'items':items,
-        'history':history,
-        'salesHistory':sales,
-        'salesSnapshot':snapshots
+    history = dict(old_history)
+    sales_history = dict(old_sales)
+
+    # Um snapshot global também é mantido para facilitar gráficos futuros.
+    snapshot = {
+        "data": generated_at,
+        "itens": len(items),
     }
-    with open(SNAP,'w',encoding='utf-8') as f: json.dump(payload,f,ensure_ascii=False,separators=(',',':'))
-    with open(HIST,'w',encoding='utf-8') as f: json.dump({'snapshots':snapshots,'salesHistory':sales,'updatedAt':generated},f,ensure_ascii=False,separators=(',',':'))
-    print(f'Gerado market.json: {len(items)}/{len(ids)} itens; histórico: {len(history)} itens; {generated}')
 
-if __name__=='__main__': main()
+    snapshots = old_snapshots.get("snapshots", [])
+    if not isinstance(snapshots, list):
+        snapshots = []
+
+    snapshots = snapshots[-167:]  # cerca de 7 dias se rodar ~24 vezes/dia
+    snapshots.append(snapshot)
+
+    for item in items:
+        item_id = str(item["id"])
+        sid = str(item.get("sid", 0))
+        key = f"{item_id}:{sid}"
+
+        price = item.get("priceMin")
+        if not isinstance(price, (int, float)) or price <= 0:
+            price = item.get("lastSoldPrice")
+
+        stock = item.get("currentStock", 0)
+
+        entry = {
+            "data": generated_at,
+            "preço": price if isinstance(price, (int, float)) else 0,
+            "estoque": stock if isinstance(stock, (int, float)) else 0,
+            "totalTrades": item.get("totalTrades", 0),
+        }
+
+        values = history.get(key, [])
+        if not isinstance(values, list):
+            values = []
+
+        # Mantém no máximo 7 dias de snapshots a cada execução horária.
+        values = values[-167:]
+        values.append(entry)
+        history[key] = values
+
+        sales_entry = {
+            "data": generated_at,
+            "últimoPreço": item.get("lastSoldPrice", 0),
+            "últimaVenda": item.get("lastSoldTime", 0),
+            "totalTrades": item.get("totalTrades", 0),
+        }
+
+        sales_values = sales_history.get(key, [])
+        if not isinstance(sales_values, list):
+            sales_values = []
+
+        sales_values = sales_values[-167:]
+        sales_values.append(sales_entry)
+        sales_history[key] = sales_values
+
+    return history, sales_history, {"snapshots": snapshots}
+
+
+def write_market(
+    previous: dict[str, Any],
+    items: list[dict[str, Any]],
+    generated_at: str,
+    source: str,
+) -> None:
+    history, sales_history, snapshots = update_history(
+        previous,
+        items,
+        generated_at,
+    )
+
+    output = {
+        "versão": SCHEMA_VERSION,
+        "Fonte": source,
+        "geradoEm": generated_at,
+        "região": "SA",
+        "totalItens": len(items),
+
+        # Compatibilidade com o formato que o site já utiliza.
+        "Unid": items,
+
+        # Histórico por item.
+        "história": history,
+        "histórico de vendas": sales_history,
+
+        # Snapshots globais.
+        "Instantâneo de vendas": snapshots,
+    }
+
+    temp_file = MARKET_FILE.with_suffix(".json.tmp")
+    temp_file.write_text(
+        json.dumps(output, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    # Troca atômica: evita deixar mercado.json quebrado se o processo parar.
+    temp_file.replace(MARKET_FILE)
+
+    print(
+        f"[OK] mercado.json atualizado com {len(items)} itens.",
+        flush=True,
+    )
+
+
+def main() -> int:
+    print("=" * 60)
+    print("BDO Lifeskill — Atualizador de Mercado SA")
+    print("=" * 60)
+
+    previous = load_existing()
+
+    print(f"[INFO] arquivo: {MARKET_FILE}")
+    print(f"[INFO] API: {API_URL}")
+
+    try:
+        payload = request_json(API_URL)
+        items = valid_market(payload)
+
+        print(f"[INFO] API retornou {len(items)} itens.")
+
+    except Exception as exc:
+        print(f"[ERRO] falha na consulta principal: {exc}", flush=True)
+        items = []
+
+    # Segurança: nunca transformar um mercado válido em 0 itens.
+    previous_items = previous.get("Unid", [])
+    previous_count = len(previous_items) if isinstance(previous_items, list) else 0
+
+    if not items:
+        print(
+            "[ERRO] A API não retornou itens válidos. "
+            "O mercado.json existente NÃO será substituído.",
+            flush=True,
+        )
+
+        # Tenta o endpoint hot apenas para diagnóstico.
+        try:
+            hot_payload = request_json(HOT_URL)
+            hot_items = valid_market(hot_payload)
+            print(
+                f"[INFO] fallback /hot retornou {len(hot_items)} itens.",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[INFO] fallback /hot também falhou: {exc}", flush=True)
+
+        if previous_count:
+            print(
+                f"[INFO] mantendo o mercado anterior com {previous_count} itens.",
+                flush=True,
+            )
+            return 0
+
+        print(
+            "[ERRO] não existe mercado anterior válido para preservar.",
+            flush=True,
+        )
+        return 1
+
+    generated_at = now_iso()
+
+    write_market(
+        previous=previous,
+        items=items,
+        generated_at=generated_at,
+        source="Arsha.io BDO Market API — SA",
+    )
+
+    # Resumo para o log do GitHub Actions.
+    print(f"[OK] geração concluída em {generated_at}")
+    print(f"[OK] itens publicados: {len(items)}")
+
+    # Mostra alguns itens para facilitar diagnóstico do Actions.
+    for item in items[:5]:
+        print(
+            "[ITEM]",
+            item.get("id"),
+            item.get("name", "Sem nome"),
+            "stock=",
+            item.get("currentStock", 0),
+            "priceMin=",
+            item.get("priceMin", 0),
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
